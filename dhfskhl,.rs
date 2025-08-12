@@ -50,18 +50,6 @@ struct PageData {
 }
 
 // --------------------
-// Compress Text
-// --------------------
-fn brotli_bytes(input: &[u8]) -> std::io::Result<Vec<u8>> {
-    let mut out = Vec::new();
-    {
-        let mut enc = CompressorWriter::new(&mut out, 4096, 6, 22);
-        enc.write_all(input)?;
-    }
-    Ok(out)
-}
-
-// --------------------
 // Score Ordering
 // --------------------
 impl PartialEq for QueueItem {
@@ -617,58 +605,39 @@ fn extract_pagedata(current_url: &str, html_body: &str) -> PageData {
 // Upsert Page
 // --------------------
 fn upsert_page(conn: &Connection, data: &PageData) -> rusqlite::Result<i64> {
-    // ----- prepare plain strings -----
-    let url_key = data.url.as_deref().unwrap_or("");
-    let title_full = data.title.clone().unwrap_or_default();
-    let title_preview: String = title_full.chars().take(200).collect();
+    // Make snippet
+    let snippet_text = data.paragraph_snippets.iter().take(8).cloned().collect::<Vec<_>>().join(" ");
 
-    // snippet
-    let snippet_text = data
-        .paragraph_snippets
-        .iter()
-        .take(8)
-        .cloned()
-        .collect::<Vec<_>>()
-        .join(" ");
+    // Compress snippet with Brotli
+    let mut compressed_snippet = Vec::<u8>::new();
+    {
+        let mut enc = CompressorWriter::new(&mut compressed_snippet, 4096, 6, 22);
+        enc.write_all(snippet_text.as_bytes()).unwrap();
+    }
 
-    let url_blob     = brotli_bytes(url_key.as_bytes())
-        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
-    let title_blob   = brotli_bytes(title_full.as_bytes())
-        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
-    let snippet_blob = brotli_bytes(snippet_text.as_bytes())
-        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
-
-    // tokens_count
-    let combined_for_len = format!("{} {}", title_full, snippet_text);
+    // Token count for ranking
+    let combined_for_len = format!("{} {}", data.title.clone().unwrap_or_default(), snippet_text);
     let tokens_count = clean_tokenize(&combined_for_len).len() as i64;
 
-    // ----- upsert -----
     conn.execute(
-        r#"
-        INSERT INTO pages (
-            url, url_blob, title, title_blob, paragraph_snippets, last_crawled_at, tokens_count
-        ) VALUES (?1, ?2, ?3, ?4, ?5, datetime('now'), ?6)
-        ON CONFLICT(url) DO UPDATE SET
-            url_blob           = excluded.url_blob,
-            title              = excluded.title,
-            title_blob         = excluded.title_blob,
-            paragraph_snippets = excluded.paragraph_snippets,
-            last_crawled_at    = excluded.last_crawled_at,
-            tokens_count       = excluded.tokens_count
-        "#,
+        r#"INSERT INTO pages (url, title, paragraph_snippets, last_crawled_at, tokens_count)
+           VALUES (?1, ?2, ?3, datetime('now'), ?4)
+           ON CONFLICT(url) DO UPDATE SET
+             title=excluded.title,
+             paragraph_snippets=excluded.paragraph_snippets,
+             last_crawled_at=excluded.last_crawled_at,
+             tokens_count=excluded.tokens_count"#,
         params![
-            url_key,
-            &url_blob,
-            title_preview, 
-            &title_blob,
-            Value::Blob(snippet_blob), 
+            data.url.as_deref().unwrap_or(""),
+            data.title.as_deref().unwrap_or(""),
+            Value::Blob(compressed_snippet), // Store as blob
             tokens_count
         ],
     )?;
 
     let page_id: i64 = conn.query_row(
         "SELECT id FROM pages WHERE url=?1",
-        [url_key],
+        [data.url.as_deref().unwrap_or("")],
         |r| r.get(0),
     )?;
 
@@ -797,5 +766,3 @@ fn index_page(conn: &mut Connection, page_id: i64, page_data: &PageData) -> rusq
 
     Ok(())
 }
-
-
